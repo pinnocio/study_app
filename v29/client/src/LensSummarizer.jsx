@@ -1,12 +1,13 @@
 import { useMemo, useState } from "react";
 import MarkdownOutput from "./MarkdownOutput.jsx";
-import ModelComparison, { providerLabel } from "./components/ModelComparison.jsx";
+import ModelComparison from "./components/ModelComparison.jsx";
 import { lensResultToMarkdown } from "./markdown.js";
 import usePersistedState from "./hooks/usePersistedState.js";
 import { saveJsonFile, saveTextFile, timestampForFile } from "./utils/fileSave.js";
 import { parseJsonResponse } from "./utils/api.js";
 import ToolActions from "./components/ToolActions.jsx";
 import { firstSuccessfulProviderKey, isCompareResponse } from "./utils/compare.js";
+import { providerLabel } from "./utils/providerLabels.js";
 
 const LANGUAGE_OPTIONS = ["English", "Hebrew"];
 const MODEL_OPTIONS = [
