@@ -1,17 +1,6 @@
 import MarkdownOutput from "../MarkdownOutput.jsx";
 import { PROVIDER_ORDER } from "../utils/compare.js";
-
-
-export const PROVIDER_LABELS = {
-  openai: "GPT 5.4",
-  gemini: "Gemini 3 Flash",
-  claude: "Claude Sonnet 4.6",
-  consensus: "Consensus",
-};
-
-export function providerLabel(providerKey) {
-  return PROVIDER_LABELS[providerKey] || providerKey;
-}
+import { providerLabel } from "../utils/providerLabels.js";
 
 function ResultCard({
   title,

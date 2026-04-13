@@ -1,12 +1,13 @@
 import { useMemo, useState } from "react";
 import MarkdownOutput from "./MarkdownOutput.jsx";
-import ModelComparison, { providerLabel } from "./components/ModelComparison.jsx";
+import ModelComparison from "./components/ModelComparison.jsx";
 import { structuredResultToMarkdown } from "./markdown.js";
 import usePersistedState from "./hooks/usePersistedState.js";
 import { saveJsonFile, saveTextFile, timestampForFile } from "./utils/fileSave.js";
 import { parseJsonResponse } from "./utils/api.js";
 import ToolActions from "./components/ToolActions.jsx";
 import { firstSuccessfulProviderKey, isCompareResponse } from "./utils/compare.js";
+import { providerLabel } from "./utils/providerLabels.js";
 
 const MODES = [
   { id: "topics_ideas", label: "Topics / Ideas" },
@@ -129,25 +130,15 @@ export default function Summarizer() {
   const usesReasoningEffort = modelMode !== "gemini";
   const compareModeActive = isCompareResponse(result);
   const compareOutputs = compareModeActive ? result.outputs : null;
-  const consensusResult = compareModeActive ? result.consensus || null : null;
   const firstSuccessfulKey = compareModeActive ? firstSuccessfulProviderKey(compareOutputs) : null;
   const effectiveSelectedResultKey = compareModeActive
-    ? selectedResultKey === "consensus" && consensusResult
-      ? "consensus"
-      : selectedResultKey && compareOutputs?.[selectedResultKey]?.status === "ok"
+    ? selectedResultKey && compareOutputs?.[selectedResultKey]?.status === "ok"
       ? selectedResultKey
       : firstSuccessfulKey
     : null;
   const selectedResult = compareModeActive
-    ? effectiveSelectedResultKey === "consensus"
-      ? consensusResult
-      : compareOutputs?.[effectiveSelectedResultKey]?.result || null
+    ? compareOutputs?.[effectiveSelectedResultKey]?.result || null
     : result;
-  const selectedBaseProviderKey = compareModeActive
-    ? effectiveSelectedResultKey && effectiveSelectedResultKey !== "consensus"
-      ? effectiveSelectedResultKey
-      : firstSuccessfulKey
-    : null;
   const markdownOutput = useMemo(
     () => structuredResultToMarkdown(selectedResult, bulletSummary),
     [selectedResult, bulletSummary]
@@ -161,17 +152,11 @@ export default function Summarizer() {
       ])
     );
   }, [compareModeActive, compareOutputs, bulletSummary]);
-  const canGenerateConsensus =
-    compareModeActive &&
-    Boolean(result?.run_id) &&
-    Boolean(selectedBaseProviderKey) &&
-    ["openai", "gemini", "claude"].every((providerKey) => compareOutputs?.[providerKey]?.status === "ok");
-
   const effortHelp =
     modelMode === "openai"
       ? "This controls GPT-5.4 reasoning effort."
       : modelMode === "compare"
-      ? "This controls GPT-5.4 and Claude reasoning effort during the three-model comparison and the optional consensus pass. Gemini remains fixed at high. In consensus, your selected direct result is used as the base version."
+      ? "This controls GPT-5.4 and Claude reasoning effort during the three-model comparison. Gemini remains fixed at high."
       : modelMode === "gemini"
       ? "Gemini uses fixed high reasoning. This setting is not used in Gemini-only mode."
       : "Claude uses adaptive thinking with the selected effort level.";
@@ -184,12 +169,7 @@ export default function Summarizer() {
   };
 
   const selectDirectResult = (providerKey) => {
-    updateSession((prev) => ({
-      selectedResultKey: providerKey,
-      result: isCompareResponse(prev.result)
-        ? { ...prev.result, consensus: null }
-        : prev.result,
-    }));
+    updateSession({ selectedResultKey: providerKey });
   };
 
   const toggleMode = (modeId) => {
@@ -230,40 +210,6 @@ export default function Summarizer() {
       updateSession({
         result: data,
         selectedResultKey: isCompareResponse(data) ? firstSuccessfulProviderKey(data.outputs) : null,
-      });
-    } catch (err) {
-      setError(err?.message || "Something went wrong.");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const generateConsensus = async () => {
-    if (!compareModeActive || !result?.run_id) return;
-
-    setLoading(true);
-    setError("");
-    setCopied(false);
-
-    try {
-      const res = await fetch("/api/analyze/consensus", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          run_id: result.run_id,
-          selected_source: selectedBaseProviderKey,
-        }),
-      });
-
-      const data = await parseJsonResponse(res, "/api/analyze/consensus");
-      updateSession({
-        result: {
-          ...result,
-          consensus: data,
-        },
-        selectedResultKey: "consensus",
       });
     } catch (err) {
       setError(err?.message || "Something went wrong.");
@@ -564,8 +510,7 @@ export default function Summarizer() {
               <>
                 <SectionTitle>Compared outputs</SectionTitle>
                 <div style={{ marginBottom: 16, fontSize: 12, color: "#666", lineHeight: 1.6 }}>
-                  Compare the three direct analyses first. Your selected result becomes the base version if
-                  you later generate consensus.
+                  Compare the three direct analyses and select the one you want to keep.
                 </div>
                 <ModelComparison
                   outputs={compareOutputs}
@@ -574,90 +519,6 @@ export default function Summarizer() {
                   onSelect={selectDirectResult}
                   dir={isRTL ? "rtl" : "ltr"}
                 />
-
-                <div style={{ marginTop: 20 }}>
-                  <SectionTitle>Optional consensus</SectionTitle>
-                  <button
-                    onClick={generateConsensus}
-                    disabled={loading || !canGenerateConsensus || Boolean(consensusResult)}
-                    style={{
-                      padding: "10px 18px",
-                      background:
-                        loading || !canGenerateConsensus || consensusResult ? "#2a2520" : "transparent",
-                      border: `1px solid ${
-                        loading || !canGenerateConsensus || consensusResult ? "#333" : "#9b8c6e"
-                      }`,
-                      borderRadius: 4,
-                      color:
-                        loading || !canGenerateConsensus || consensusResult ? "#666" : "#d4c4a0",
-                      fontSize: 12,
-                      cursor:
-                        loading || !canGenerateConsensus || consensusResult ? "default" : "pointer",
-                      fontFamily: "inherit",
-                    }}
-                  >
-                    {consensusResult ? "Consensus generated" : "Generate consensus"}
-                  </button>
-                  <div style={{ marginTop: 8, fontSize: 12, color: "#666", lineHeight: 1.6 }}>
-                    {canGenerateConsensus
-                      ? "Consensus uses the currently selected direct result as the base version and the other two as supporting improvements."
-                      : "Consensus becomes available only when all three compare outputs succeed."}
-                  </div>
-                </div>
-
-                {consensusResult && (
-                  <div
-                    style={{
-                      marginTop: 20,
-                      background: effectiveSelectedResultKey === "consensus" ? "#141210" : "#0f0f0f",
-                      border: `1px solid ${
-                        effectiveSelectedResultKey === "consensus" ? "#9b8c6e" : "#242424"
-                      }`,
-                      borderRadius: 8,
-                      padding: "18px 20px",
-                    }}
-                  >
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: 12,
-                        flexWrap: "wrap",
-                        marginBottom: 14,
-                      }}
-                    >
-                      <div>
-                        <div style={{ fontSize: 16, color: "#efe6d4", fontWeight: 600 }}>
-                          Consensus
-                        </div>
-                        <div style={{ marginTop: 4, fontSize: 12, color: "#6a9" }}>Ready</div>
-                      </div>
-                      <button
-                        onClick={() => updateSession({ selectedResultKey: "consensus" })}
-                        style={{
-                          padding: "8px 14px",
-                          background: "transparent",
-                          border: `1px solid ${
-                            effectiveSelectedResultKey === "consensus" ? "#9b8c6e" : "#444"
-                          }`,
-                          borderRadius: 4,
-                          color: effectiveSelectedResultKey === "consensus" ? "#d4c4a0" : "#888",
-                          fontSize: 12,
-                          cursor: "pointer",
-                          fontFamily: "inherit",
-                        }}
-                      >
-                        {effectiveSelectedResultKey === "consensus" ? "Selected" : "Select"}
-                      </button>
-                    </div>
-                    <MarkdownOutput
-                      content={structuredResultToMarkdown(consensusResult, bulletSummary)}
-                      dir={isRTL ? "rtl" : "ltr"}
-                      style={{ background: "transparent", border: "none", padding: 0 }}
-                    />
-                  </div>
-                )}
 
                 {effectiveSelectedResultKey && selectedResult ? (
                   <div style={{ marginTop: 18, fontSize: 12, color: "#666" }}>
