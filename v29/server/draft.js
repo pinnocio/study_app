@@ -1,5 +1,4 @@
 import { getAnthropicClient, getGeminiClient, getOpenAIClient } from "./providerClients.js";
-import { createStoredRun, getStoredRun } from "./runStore.js";
 
 const REGISTERS = [
   "general_academic",
@@ -72,36 +71,6 @@ const MAX_CLARIFICATION_ANSWER_CHARS = 1000;
 
 function normalizeEffort(effort) {
   return effort === "high" ? "high" : effort === "medium" ? "medium" : "low";
-}
-
-const PROVIDER_SOURCES = ["openai", "gemini", "claude"];
-
-function normalizeSelectedSource(selectedSource, candidates) {
-  const normalized = PROVIDER_SOURCES.includes(selectedSource) ? selectedSource : null;
-  if (!normalized) {
-    return null;
-  }
-
-  return Array.isArray(candidates) && candidates.some((item) => item?.source === normalized)
-    ? normalized
-    : null;
-}
-
-function orderCandidatesForSynthesis(candidates, selectedSource) {
-  if (!Array.isArray(candidates)) {
-    return [];
-  }
-
-  if (!selectedSource) {
-    return candidates;
-  }
-
-  const baseCandidate = candidates.find((item) => item?.source === selectedSource);
-  if (!baseCandidate) {
-    return candidates;
-  }
-
-  return [baseCandidate, ...candidates.filter((item) => item?.source !== selectedSource)];
 }
 
 function normalizeAnswers(value) {
@@ -544,103 +513,6 @@ async function callClaudeProvider(
   return normalized;
 }
 
-async function callDraftConsensus({
-  thoughtDump,
-  writingSample,
-  register,
-  outputLanguage,
-  clarificationAnswers,
-  currentDraft,
-  revisionInstruction,
-  candidates,
-  selectedSource,
-  openaiEffort,
-}) {
-  const isRevisionMode = Boolean(revisionInstruction && currentDraft);
-  const consensusInstructions = `You are the consensus model for an academic thought-to-draft tool.
-
-You will receive:
-1. the original rough thought dump
-2. an optional writing sample
-3. optional clarification answers
-4. an optional current draft plus revision instruction
-5. candidate drafts from three providers
-
-Your task:
-- produce the single best final draft result
-- treat the user-selected base candidate as the primary anchor version
-- preserve the selected base candidate's core structure, argument flow, and strongest justified choices unless the original material clearly requires a correction
-- use the other candidate drafts as supporting material to improve, sharpen, clarify, or fill justified gaps in the base version
-- do not simply choose one candidate wholesale or replace the selected base version unnecessarily
-- preserve the user's actual claim, hedges, and argumentative shape
-- remove any material that is generic, overconfident, weakly grounded, or invented
-- if the candidates disagree, choose the narrowest defensible reading of the user's claim
-- clarification is already complete for this request; do not ask questions
-- notes must stay brief and concrete
-- all output must be in ${outputLanguage}
-- output only valid JSON matching the schema for register ${register}`;
-
-  const orderedCandidates = orderCandidatesForSynthesis(candidates, selectedSource);
-
-  const candidateBlocks = orderedCandidates.map(
-    ({ source, candidate }) => `${source === selectedSource ? "USER-SELECTED BASE" : "SUPPLEMENTAL"} ${source.toUpperCase()} candidate:
-${JSON.stringify(candidate, null, 2)}`
-  );
-
-  const consensusInput = [
-    `Register:\n${register}`,
-    `Output language:\n${outputLanguage}`,
-    writingSample ? `Writing sample (style anchor only):\n${writingSample}` : "Writing sample: none provided.",
-    `Thought dump:\n${thoughtDump}`,
-    clarificationAnswers.length > 0
-      ? `Clarification answers:\n${clarificationAnswers.map((item, index) => `${index + 1}. ${item}`).join("\n")}`
-      : "Clarification answers: none provided.",
-    revisionInstruction ? `Revision instruction:\n${revisionInstruction}` : "",
-    currentDraft ? `Current draft:\n${currentDraft}` : "",
-    selectedSource ? `User-selected base candidate:
-${selectedSource}` : "",
-    ...candidateBlocks,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-
-  const response = await getOpenAIClient().responses.create({
-    model: "gpt-5.4",
-    store: false,
-    reasoning: { effort: openaiEffort },
-    input: consensusInput,
-    instructions: consensusInstructions,
-    text: {
-      format: {
-        type: "json_schema",
-        name: "thought_to_draft_consensus",
-        strict: true,
-        schema: {
-          ...DRAFT_SCHEMA,
-          properties: {
-            ...DRAFT_SCHEMA.properties,
-            output_language: { type: "string", enum: [outputLanguage] },
-            register: { type: "string", enum: [register] },
-          },
-        },
-      },
-    },
-  });
-
-  const text = response.output_text?.trim();
-  if (!text) {
-    throw new Error("Consensus model returned no content");
-  }
-
-  const parsed = JSON.parse(text);
-  if (!isValidDraftOnlyResult(parsed, outputLanguage, register)) {
-    throw new Error("Consensus model returned invalid output");
-  }
-
-  return parsed;
-}
-
-
 function buildCompareResultEntry(settledResult, source, outputLanguage, register) {
   if (settledResult.status === "fulfilled") {
     return {
@@ -785,38 +657,13 @@ export async function draftHandler(req, res) {
       ),
     ]);
 
-    const candidates = [];
-    if (openaiResult.status === "fulfilled") {
-      candidates.push({ source: "openai", candidate: openaiResult.value });
-    }
-    if (geminiResult.status === "fulfilled") {
-      candidates.push({ source: "gemini", candidate: geminiResult.value });
-    }
-    if (claudeResult.status === "fulfilled") {
-      candidates.push({ source: "claude", candidate: claudeResult.value });
-    }
-
-    const run_id = createStoredRun("draft", {
-      thoughtDump,
-      writingSample,
-      register,
-      outputLanguage,
-      clarificationAnswers,
-      currentDraft,
-      revisionInstruction,
-      openaiEffort,
-      candidates,
-    });
-
     return res.json({
       mode: "compare",
-      run_id,
       outputs: {
         openai: buildCompareResultEntry(openaiResult, "openai", outputLanguage, register),
         gemini: buildCompareResultEntry(geminiResult, "gemini", outputLanguage, register),
         claude: buildCompareResultEntry(claudeResult, "claude", outputLanguage, register),
       },
-      consensus: null,
     });
   } catch (error) {
     console.error(error);
@@ -826,55 +673,3 @@ export async function draftHandler(req, res) {
   }
 }
 
-export async function draftConsensusHandler(req, res) {
-  try {
-    const runId = String(req.body?.run_id || "").trim();
-
-    if (!runId) {
-      return res.status(400).json({ error: "A compare run_id is required." });
-    }
-
-    const storedRun = getStoredRun(runId, "draft");
-
-    if (!storedRun) {
-      return res.status(404).json({ error: "That compare run was not found or has expired." });
-    }
-
-    if (!Array.isArray(storedRun.candidates) || storedRun.candidates.length < 1) {
-      return res.status(400).json({
-        error: "Consensus requires at least one successful compare output.",
-      });
-    }
-
-    const selectedSource = normalizeSelectedSource(
-      String(req.body?.selected_source || "").trim(),
-      storedRun.candidates
-    );
-
-    if (!selectedSource) {
-      return res.status(400).json({
-        error: "Please select one of the direct model outputs to use as the synthesis base.",
-      });
-    }
-
-    const consensus = await callDraftConsensus({
-      thoughtDump: storedRun.thoughtDump,
-      writingSample: storedRun.writingSample,
-      register: storedRun.register,
-      outputLanguage: storedRun.outputLanguage,
-      clarificationAnswers: storedRun.clarificationAnswers,
-      currentDraft: storedRun.currentDraft,
-      revisionInstruction: storedRun.revisionInstruction,
-      candidates: storedRun.candidates,
-      selectedSource,
-      openaiEffort: storedRun.openaiEffort,
-    });
-
-    return res.json(toDraftApiResult(consensus, storedRun.outputLanguage, storedRun.register));
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({
-      error: error?.message || "Something went wrong on the server.",
-    });
-  }
-}

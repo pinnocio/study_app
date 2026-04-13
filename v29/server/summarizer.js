@@ -1,5 +1,4 @@
 import { getAnthropicClient, getGeminiClient, getOpenAIClient } from "./providerClients.js";
-import { createStoredRun, getStoredRun } from "./runStore.js";
 
 const MODES = [
   "topics_ideas",
@@ -29,36 +28,6 @@ const CLAUDE_MAX_TOKENS = 8000;
 
 function normalizeEffort(effort) {
   return effort === "high" ? "high" : effort === "medium" ? "medium" : "low";
-}
-
-const PROVIDER_SOURCES = ["openai", "gemini", "claude"];
-
-function normalizeSelectedSource(selectedSource, candidates) {
-  const normalized = PROVIDER_SOURCES.includes(selectedSource) ? selectedSource : null;
-  if (!normalized) {
-    return null;
-  }
-
-  return Array.isArray(candidates) && candidates.some((item) => item?.source === normalized)
-    ? normalized
-    : null;
-}
-
-function orderCandidatesForSynthesis(candidates, selectedSource) {
-  if (!Array.isArray(candidates)) {
-    return [];
-  }
-
-  if (!selectedSource) {
-    return candidates;
-  }
-
-  const baseCandidate = candidates.find((item) => item?.source === selectedSource);
-  if (!baseCandidate) {
-    return candidates;
-  }
-
-  return [baseCandidate, ...candidates.filter((item) => item?.source !== selectedSource)];
 }
 
 function isAllowedCombination(modes) {
@@ -412,89 +381,6 @@ async function callClaudeProvider(
   return parsed;
 }
 
-async function callSummarizerConsensus({
-  input,
-  selectedModes,
-  outputLanguage,
-  candidates,
-  selectedSource,
-  openaiEffort,
-  bulletSummary,
-}) {
-  const schema = buildSchema(selectedModes, outputLanguage);
-
-  const consensusInstructions = `You are the consensus model for structured academic text analysis.
-
-You will receive:
-1. the original text
-2. the selected modes
-3. candidate analyses from three providers
-
-Your task:
-- produce the single best final structured analysis
-- use only the selected modes
-- first identify and remove any material in any candidate that is irrelevant, weakly supported, redundant, off-mode, or inconsistent with the original text
-- then synthesize the strongest remaining relevant material into one final result
-- treat the user-selected base candidate as the primary anchor version
-- preserve the selected base candidate's core structure and strongest justified choices unless the original input clearly requires a correction
-- use the other candidate outputs as supporting material to improve, sharpen, clarify, or fill justified gaps in the base version
-- do not simply pick one candidate wholesale or replace the selected base version unnecessarily
-- stay grounded in the original text
-- do not mention providers
-- do not add unsupported claims or frameworks
-- respect the requested bullet-style preference for how concise or prose-like the schema text should read
-- output only valid JSON matching the schema
-
-${buildFormattingInstructions(bulletSummary)}`;
-
-  const orderedCandidates = orderCandidatesForSynthesis(candidates, selectedSource);
-
-  const candidateBlocks = orderedCandidates.map(
-    ({ source, candidate }) =>
-      `${source === selectedSource ? "USER-SELECTED BASE" : "SUPPLEMENTAL"} ${source.toUpperCase()} candidate:
-${JSON.stringify(candidate, null, 2)}`
-  );
-
-  const consensusInput = [
-    `Selected modes:\n${selectedModes.join(", ")}`,
-    `Requested output language:\n${outputLanguage}`,
-    `Bullet summary:\n${bulletSummary ? "ON" : "OFF"}`,
-    `Original text:\n${input}`,
-    selectedSource ? `User-selected base candidate:
-${selectedSource}` : "",
-    ...candidateBlocks,
-  ].join("\n\n");
-
-  const response = await getOpenAIClient().responses.create({
-    model: "gpt-5.4",
-    store: false,
-    reasoning: { effort: openaiEffort },
-    input: consensusInput,
-    instructions: consensusInstructions,
-    text: {
-      format: {
-        type: "json_schema",
-        name: "text_analysis_consensus",
-        strict: true,
-        schema,
-      },
-    },
-  });
-
-  const text = response.output_text?.trim();
-  if (!text) {
-    throw new Error("Consensus model returned no content");
-  }
-
-  const parsed = JSON.parse(text);
-  if (!basicValidate(parsed, selectedModes, outputLanguage)) {
-    throw new Error("Consensus model returned invalid output");
-  }
-
-  return parsed;
-}
-
-
 function buildCompareResultEntry(settledResult, source) {
   if (settledResult.status === "fulfilled") {
     return {
@@ -590,89 +476,14 @@ export async function analyzeHandler(req, res) {
       ),
     ]);
 
-    const candidates = [];
-
-    if (openaiResult.status === "fulfilled") {
-      candidates.push({ source: "openai", candidate: openaiResult.value });
-    }
-
-    if (geminiResult.status === "fulfilled") {
-      candidates.push({ source: "gemini", candidate: geminiResult.value });
-    }
-
-    if (claudeResult.status === "fulfilled") {
-      candidates.push({ source: "claude", candidate: claudeResult.value });
-    }
-
-    const run_id = createStoredRun("summarizer", {
-      input,
-      selectedModes,
-      outputLanguage,
-      openaiEffort,
-      bulletSummary,
-      candidates,
-    });
-
     return res.json({
       mode: "compare",
-      run_id,
       outputs: {
         openai: buildCompareResultEntry(openaiResult, "openai"),
         gemini: buildCompareResultEntry(geminiResult, "gemini"),
         claude: buildCompareResultEntry(claudeResult, "claude"),
       },
-      consensus: null,
     });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({
-      error: error?.message || "Something went wrong on the server.",
-    });
-  }
-}
-
-export async function analyzeConsensusHandler(req, res) {
-  try {
-    const runId = String(req.body?.run_id || "").trim();
-
-    if (!runId) {
-      return res.status(400).json({ error: "A compare run_id is required." });
-    }
-
-    const storedRun = getStoredRun(runId, "summarizer");
-
-    if (!storedRun) {
-      return res.status(404).json({ error: "That compare run was not found or has expired." });
-    }
-
-    if (!Array.isArray(storedRun.candidates) || storedRun.candidates.length < 1) {
-      return res.status(400).json({
-        error: "Consensus requires at least one successful compare output.",
-      });
-    }
-
-    const selectedSource = normalizeSelectedSource(
-      String(req.body?.selected_source || "").trim(),
-      storedRun.candidates
-    );
-
-    if (!selectedSource) {
-      return res.status(400).json({
-        error: "Please select one of the direct model outputs to use as the synthesis base.",
-      });
-    }
-
-    const consensus = await callSummarizerConsensus({
-      input: storedRun.input,
-      selectedModes: storedRun.selectedModes,
-      outputLanguage: storedRun.outputLanguage,
-      candidates: storedRun.candidates,
-      selectedSource,
-      openaiEffort: storedRun.openaiEffort,
-      bulletSummary: storedRun.bulletSummary,
-    });
-
-    return res.json(consensus);
   } catch (error) {
     console.error(error);
     return res.status(500).json({

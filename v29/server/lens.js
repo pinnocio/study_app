@@ -1,5 +1,4 @@
 import { getAnthropicClient, getGeminiClient, getOpenAIClient } from "./providerClients.js";
-import { createStoredRun, getStoredRun } from "./runStore.js";
 
 const JSON_SCHEMA = {
   type: "object",
@@ -48,36 +47,6 @@ const MAX_FORCED_APPLICATION_CHARS = 1000;
 
 function normalizeEffort(effort) {
   return effort === "high" ? "high" : effort === "medium" ? "medium" : "low";
-}
-
-const PROVIDER_SOURCES = ["openai", "gemini", "claude"];
-
-function normalizeSelectedSource(selectedSource, candidates) {
-  const normalized = PROVIDER_SOURCES.includes(selectedSource) ? selectedSource : null;
-  if (!normalized) {
-    return null;
-  }
-
-  return Array.isArray(candidates) && candidates.some((item) => item?.source === normalized)
-    ? normalized
-    : null;
-}
-
-function orderCandidatesForSynthesis(candidates, selectedSource) {
-  if (!Array.isArray(candidates)) {
-    return [];
-  }
-
-  if (!selectedSource) {
-    return candidates;
-  }
-
-  const baseCandidate = candidates.find((item) => item?.source === selectedSource);
-  if (!baseCandidate) {
-    return candidates;
-  }
-
-  return [baseCandidate, ...candidates.filter((item) => item?.source !== selectedSource)];
 }
 
 function parseLenses(rawLens) {
@@ -283,95 +252,6 @@ async function callClaudeProvider(
   return parsed;
 }
 
-async function callLensConsensus({
-  input,
-  rawLens,
-  parsedLenses,
-  outputLanguage,
-  forcedApplication,
-  candidates,
-  selectedSource,
-  openaiEffort,
-  bulletSummary,
-}) {
-  const consensusInstructions = `You are the consensus model for a lens-guided summarizer.
-
-You will receive:
-1. the original source text
-2. the raw user-supplied lens input
-3. the parsed lens list
-4. candidate outputs from three providers
-
-Your task:
-- produce the single best final result
-- first identify and remove any material in any candidate that is irrelevant, weakly grounded, redundant, off-lens, or inconsistent with the source text or forced lens application
-- then synthesize the strongest remaining relevant material into one final result
-- treat the user-selected base candidate as the primary anchor version
-- preserve the selected base candidate's core structure and strongest justified choices unless the original input clearly requires a correction
-- use the other candidate outputs as supporting material to improve, sharpen, clarify, or fill justified gaps in the base version
-- do not simply pick one candidate wholesale or replace the selected base version unnecessarily
-- stay fully grounded in the source text
-- use the lens or lenses to organize and foreground, not to invent
-- if multiple lenses were supplied, either combine them coherently or, when needed, return options that differ materially
-- do not mention providers
-- if bullet summary is ON and you return a summary, format it as concise bullet points
-- if bullet summary is OFF and you return a summary, format it as prose
-- output only valid JSON matching the schema
-- all output must be in ${outputLanguage}
-
-${forcedApplication ? "A lens application was selected by the user. You must use it and return a summary, not options." : ""}`.trim();
-
-  const orderedCandidates = orderCandidatesForSynthesis(candidates, selectedSource);
-
-  const candidateBlocks = orderedCandidates.map(
-    ({ source, candidate }) =>
-      `${source === selectedSource ? "USER-SELECTED BASE" : "SUPPLEMENTAL"} ${source.toUpperCase()} candidate:
-${JSON.stringify(candidate, null, 2)}`
-  );
-
-  const consensusInput = [
-    `Raw lens input:\n${rawLens}`,
-    `Parsed lenses:\n${parsedLenses.join(" | ")}`,
-    `Bullet summary:\n${bulletSummary ? "ON" : "OFF"}`,
-    forcedApplication ? `Forced lens application:\n${forcedApplication}` : "",
-    `Source text:\n${input}`,
-    selectedSource ? `User-selected base candidate:
-${selectedSource}` : "",
-    ...candidateBlocks,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-
-  const response = await getOpenAIClient().responses.create({
-    model: "gpt-5.4",
-    store: false,
-    reasoning: { effort: openaiEffort },
-    input: consensusInput,
-    instructions: consensusInstructions,
-    text: {
-      format: {
-        type: "json_schema",
-        name: "lens_summarizer_consensus",
-        strict: true,
-        schema: JSON_SCHEMA,
-      },
-    },
-  });
-
-  const text = response.output_text?.trim();
-  if (!text) {
-    throw new Error("Consensus model returned no content");
-  }
-
-  const parsed = JSON.parse(text);
-  if (!isValidLensResult(parsed, outputLanguage, forcedApplication, bulletSummary)) {
-    throw new Error("Consensus model returned invalid output");
-  }
-
-  return parsed;
-}
-
-
 function buildCompareResultEntry(settledResult, source) {
   if (settledResult.status === "fulfilled") {
     return {
@@ -496,37 +376,13 @@ export async function lensHandler(req, res) {
       ),
     ]);
 
-    const candidates = [];
-    if (openaiResult.status === "fulfilled") {
-      candidates.push({ source: "openai", candidate: openaiResult.value });
-    }
-    if (geminiResult.status === "fulfilled") {
-      candidates.push({ source: "gemini", candidate: geminiResult.value });
-    }
-    if (claudeResult.status === "fulfilled") {
-      candidates.push({ source: "claude", candidate: claudeResult.value });
-    }
-
-    const run_id = createStoredRun("lens", {
-      input,
-      rawLens,
-      parsedLenses,
-      outputLanguage,
-      forcedApplication,
-      openaiEffort,
-      bulletSummary,
-      candidates,
-    });
-
     return res.json({
       mode: "compare",
-      run_id,
       outputs: {
         openai: buildCompareResultEntry(openaiResult, "openai"),
         gemini: buildCompareResultEntry(geminiResult, "gemini"),
         claude: buildCompareResultEntry(claudeResult, "claude"),
       },
-      consensus: null,
     });
   } catch (error) {
     console.error(error);
@@ -536,54 +392,3 @@ export async function lensHandler(req, res) {
   }
 }
 
-export async function lensConsensusHandler(req, res) {
-  try {
-    const runId = String(req.body?.run_id || "").trim();
-
-    if (!runId) {
-      return res.status(400).json({ error: "A compare run_id is required." });
-    }
-
-    const storedRun = getStoredRun(runId, "lens");
-
-    if (!storedRun) {
-      return res.status(404).json({ error: "That compare run was not found or has expired." });
-    }
-
-    if (!Array.isArray(storedRun.candidates) || storedRun.candidates.length < 1) {
-      return res.status(400).json({
-        error: "Consensus requires at least one successful compare output.",
-      });
-    }
-
-    const selectedSource = normalizeSelectedSource(
-      String(req.body?.selected_source || "").trim(),
-      storedRun.candidates
-    );
-
-    if (!selectedSource) {
-      return res.status(400).json({
-        error: "Please select one of the direct model outputs to use as the synthesis base.",
-      });
-    }
-
-    const consensus = await callLensConsensus({
-      input: storedRun.input,
-      rawLens: storedRun.rawLens,
-      parsedLenses: storedRun.parsedLenses,
-      outputLanguage: storedRun.outputLanguage,
-      forcedApplication: storedRun.forcedApplication,
-      candidates: storedRun.candidates,
-      selectedSource,
-      openaiEffort: storedRun.openaiEffort,
-      bulletSummary: storedRun.bulletSummary,
-    });
-
-    return res.json(consensus);
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({
-      error: error?.message || "Something went wrong on the server.",
-    });
-  }
-}

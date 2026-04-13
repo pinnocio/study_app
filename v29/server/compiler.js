@@ -1,5 +1,4 @@
 import { getAnthropicClient, getGeminiClient, getOpenAIClient } from "./providerClients.js";
-import { createStoredRun, getStoredRun } from "./runStore.js";
 
 const PERSONAS = [
   "Developmental Editor",
@@ -246,86 +245,12 @@ const BASE_JSON_SCHEMA = {
   required: ["persona", "refined", "style_summary", "why", "full_prompt"],
 };
 
-const CONSENSUS_JSON_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    persona: {
-      type: "string",
-      enum: PERSONAS,
-    },
-    refined: {
-      type: "string",
-    },
-    style_summary: {
-      type: "string",
-    },
-    why: {
-      type: "string",
-    },
-    full_prompt: {
-      type: "string",
-    },
-    decision_type: {
-      type: "string",
-      enum: ["consensus_filtered_synthesis"],
-    },
-    decision_source: {
-      type: "string",
-      enum: ["synthesized"],
-    },
-    decision_note: {
-      type: "string",
-    },
-  },
-  required: [
-    "persona",
-    "refined",
-    "style_summary",
-    "why",
-    "full_prompt",
-    "decision_type",
-    "decision_source",
-    "decision_note",
-  ],
-};
-
 const MAX_COMPILER_INPUT_CHARS = 3000;
 const CLAUDE_MAX_TOKENS = 8000;
 const VALID_DEPTHS = ["Light", "Moderate", "Deep", "Adversarial"];
 
 function normalizeEffort(effort) {
   return effort === "high" ? "high" : effort === "medium" ? "medium" : "low";
-}
-
-const PROVIDER_SOURCES = ["openai", "gemini", "claude"];
-
-function normalizeSelectedSource(selectedSource, candidates) {
-  const normalized = PROVIDER_SOURCES.includes(selectedSource) ? selectedSource : null;
-  if (!normalized) {
-    return null;
-  }
-
-  return Array.isArray(candidates) && candidates.some((item) => item?.source === normalized)
-    ? normalized
-    : null;
-}
-
-function orderCandidatesForSynthesis(candidates, selectedSource) {
-  if (!Array.isArray(candidates)) {
-    return [];
-  }
-
-  if (!selectedSource) {
-    return candidates;
-  }
-
-  const baseCandidate = candidates.find((item) => item?.source === selectedSource);
-  if (!baseCandidate) {
-    return candidates;
-  }
-
-  return [baseCandidate, ...candidates.filter((item) => item?.source !== selectedSource)];
 }
 
 function normalizeDepth(depth) {
@@ -401,24 +326,6 @@ if (result.persona === "Faithful Translator" && !translationRequested(originalIn
   return true;
 }
 
-
-function isValidConsensusResult(result, originalInput) {
-  if (!isValidBaseResult(result, originalInput)) {
-    return false;
-  }
-
-  if (
-    !result ||
-    result.decision_type !== "consensus_filtered_synthesis" ||
-    result.decision_source !== "synthesized" ||
-    typeof result.decision_note !== "string" ||
-    !result.decision_note.trim()
-  ) {
-    return false;
-  }
-
-  return true;
-}
 
 function withDecisionMeta(result, decision_type, decision_source, decision_note) {
   return {
@@ -524,115 +431,6 @@ async function callClaudeProvider(userMessage, originalInput, claudeEffort) {
   return parsed;
 }
 
-async function callCompilerConsensus({
-  originalInput,
-  depth,
-  outputLanguage,
-  candidates,
-  selectedSource,
-  openaiEffort,
-}) {
-  const consensusInstructions = `You are the consensus model for a prompt-role compiler.
-
-You will receive:
-1. the original user request
-2. candidate outputs from three providers
-
-Your task:
-- produce the single best final result
-- first identify and remove any material in any candidate that is irrelevant, weakly justified, off-task, redundant, or inconsistent with the original user request
-- then synthesize the strongest remaining relevant material into one final result
-- treat the user-selected base candidate as the primary anchor version
-- preserve the selected base candidate's core structure and strongest justified choices unless the original input clearly requires a correction
-- use the other candidate outputs as supporting material to improve, sharpen, clarify, or fill justified gaps in the base version
-- do not simply pick one candidate wholesale or replace the selected base version unnecessarily
-- keep only information justified by the original user request
-- preserve the best justified style interpretation, but do not copy candidate wording literally unless necessary
-- produce one normalized "style_summary" that captures the inferred operative style qualities in fresh wording, or an empty string if no real style signal exists
-- do not mention providers
-- preserve the translation-only rule:
-  "Faithful Translator" is allowed ONLY if the user explicitly asked for translation
-- all output fields must be in the requested output language
-- preserve these formatting requirements exactly:
-  - "why" must be a single short paragraph
-  - "full_prompt" must follow the formatting rules below
-
-${INTERNAL_STYLE_TAXONOMY}
-
-${INTERNAL_DEPTH_GUIDANCE}
-
-${INTERNAL_QUALITY_FRAME}
-
-${INTERNAL_REQUIREMENT_PRESERVATION}
-
-General behavior rules:
-- Default to minimality.
-- Do not try too hard to be specific.
-- Prefer the simpler, cleaner prompt when two options seem equally viable.
-- Add control structure only when it clearly improves the result.
-- Deep should improve synthesis and prioritization, not literalism.
-- Do not convert every user phrase into a control condition.
-
-Transparency rules:
-- You must explicitly report that the result is a filtered synthesis.
-- "decision_type" must be "consensus_filtered_synthesis".
-- "decision_source" must be "synthesized".
-- "decision_note" must be one short sentence explaining that irrelevant material was removed before synthesis.
-
-${FULL_PROMPT_TEMPLATE_RULES}
-
-Return only valid JSON matching the schema.`;
-
-  const orderedCandidates = orderCandidatesForSynthesis(candidates, selectedSource);
-
-  const candidateBlocks = orderedCandidates.map(
-    ({ source, candidate }) =>
-      `${source === selectedSource ? "USER-SELECTED BASE" : "SUPPLEMENTAL"} ${source.toUpperCase()} candidate:
-${JSON.stringify(candidate, null, 2)}`
-  );
-
-  const consensusInput = [
-    `Original user request:\n${originalInput}`,
-    depth ? `Requested depth:\n${depth}` : "",
-    `Requested output language:\n${outputLanguage}`,
-    selectedSource ? `User-selected base candidate:
-${selectedSource}` : "",
-    ...candidateBlocks,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-
-  const response = await getOpenAIClient().responses.create({
-    model: "gpt-5.4",
-    store: false,
-    reasoning: { effort: openaiEffort },
-    input: consensusInput,
-    instructions: consensusInstructions,
-    text: {
-      format: {
-        type: "json_schema",
-        name: "persona_compiler_consensus",
-        strict: true,
-        schema: CONSENSUS_JSON_SCHEMA,
-      },
-    },
-  });
-
-  const text = response.output_text?.trim();
-
-  if (!text) {
-    throw new Error("Consensus model returned no content");
-  }
-
-  const parsed = JSON.parse(text);
-
-  if (!isValidConsensusResult(parsed, originalInput)) {
-    throw new Error("Consensus model returned invalid JSON or invalid decision metadata");
-  }
-
-  return parsed;
-}
-
 function buildCompareResultEntry(source, settledResult, originalInput) {
   if (settledResult.status === "fulfilled") {
     const providerName = source === "openai" ? "OpenAI" : source === "gemini" ? "Gemini" : "Claude";
@@ -642,7 +440,7 @@ function buildCompareResultEntry(source, settledResult, originalInput) {
         settledResult.value,
         "direct",
         source,
-        `Comparison mode was used, so this card shows the direct ${providerName} result before any optional consensus pass.`
+        `Comparison mode was used, so this card shows the direct ${providerName} result in compare mode.`
       ),
     };
   }
@@ -688,7 +486,7 @@ export async function compilerHandler(req, res) {
           result,
           "direct",
           "openai",
-          "Direct mode was used, so the final result comes from OpenAI without a consensus pass."
+          "Direct mode was used, so the final result comes from OpenAI in direct mode."
         )
       );
     }
@@ -700,7 +498,7 @@ export async function compilerHandler(req, res) {
           result,
           "direct",
           "gemini",
-          "Direct mode was used, so the final result comes from Gemini without a consensus pass."
+          "Direct mode was used, so the final result comes from Gemini in direct mode."
         )
       );
     }
@@ -712,7 +510,7 @@ export async function compilerHandler(req, res) {
           result,
           "direct",
           "claude",
-          "Direct mode was used, so the final result comes from Claude without a consensus pass."
+          "Direct mode was used, so the final result comes from Claude in direct mode."
         )
       );
     }
@@ -723,37 +521,13 @@ export async function compilerHandler(req, res) {
       callClaudeProvider(userMessage, input, openaiEffort),
     ]);
 
-    const candidates = [];
-
-    if (openaiResult.status === "fulfilled") {
-      candidates.push({ source: "openai", candidate: openaiResult.value });
-    }
-
-    if (geminiResult.status === "fulfilled") {
-      candidates.push({ source: "gemini", candidate: geminiResult.value });
-    }
-
-    if (claudeResult.status === "fulfilled") {
-      candidates.push({ source: "claude", candidate: claudeResult.value });
-    }
-
-    const run_id = createStoredRun("compiler", {
-      input,
-      depth,
-      outputLanguage,
-      openaiEffort,
-      candidates,
-    });
-
     return res.json({
       mode: "compare",
-      run_id,
       outputs: {
         openai: buildCompareResultEntry("openai", openaiResult, input),
         gemini: buildCompareResultEntry("gemini", geminiResult, input),
         claude: buildCompareResultEntry("claude", claudeResult, input),
       },
-      consensus: null,
     });
   } catch (error) {
     console.error(error);
@@ -763,51 +537,3 @@ export async function compilerHandler(req, res) {
   }
 }
 
-export async function compilerConsensusHandler(req, res) {
-  try {
-    const runId = String(req.body?.run_id || "").trim();
-
-    if (!runId) {
-      return res.status(400).json({ error: "A compare run_id is required." });
-    }
-
-    const storedRun = getStoredRun(runId, "compiler");
-
-    if (!storedRun) {
-      return res.status(404).json({ error: "That compare run was not found or has expired." });
-    }
-
-    if (!Array.isArray(storedRun.candidates) || storedRun.candidates.length < 1) {
-      return res.status(400).json({
-        error: "Consensus requires at least one successful compare output.",
-      });
-    }
-
-    const selectedSource = normalizeSelectedSource(
-      String(req.body?.selected_source || "").trim(),
-      storedRun.candidates
-    );
-
-    if (!selectedSource) {
-      return res.status(400).json({
-        error: "Please select one of the direct model outputs to use as the synthesis base.",
-      });
-    }
-
-    const consensus = await callCompilerConsensus({
-      originalInput: storedRun.input,
-      depth: storedRun.depth,
-      outputLanguage: storedRun.outputLanguage,
-      candidates: storedRun.candidates,
-      selectedSource,
-      openaiEffort: storedRun.openaiEffort,
-    });
-
-    return res.json(consensus);
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({
-      error: error?.message || "Something went wrong on the server.",
-    });
-  }
-}
